@@ -1,0 +1,110 @@
+name: monitor
+on:
+  schedule:
+    - cron: "7,37 * * * *"          # off-peak minutes; UTC; best-effort
+  workflow_dispatch:
+    inputs:
+      force_change:
+        description: "Seed dummy baseline to force a CHANGE email (test)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                    # state commits + keepalive
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false          # queue, never kill a run mid-commit
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Compute Playwright cache key
+        run: |
+          echo "PW_VERSION=$(python -c 'from importlib.metadata import version; print(version("playwright"))')" >> "$GITHUB_ENV"
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ env.PW_VERSION }}
+
+      - name: Install Chromium (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Chromium OS deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      - name: Fetch Buster extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/get_buster.sh
+
+      - name: Restore fail counter
+        uses: actions/cache/restore@v4
+        with:
+          path: .failcount
+          key: failcount-${{ github.run_id }}   # never hits; falls to restore-keys
+          restore-keys: |
+            failcount-
+
+      - name: Run check
+        id: check
+        env:
+          CI: "1"
+          STRICT: "1"
+          DEBUG_DIR: debug
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_CC: ${{ secrets.EMAIL_CC }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          FAIL_ALERT_THRESHOLD: "8"
+          FORCE_CHANGE: ${{ inputs.force_change == true && 'true' || 'false' }}
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" bash ci_check.sh
+
+      - name: Save fail counter
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .failcount
+          key: failcount-${{ github.run_id }}   # unique key so save always succeeds
+
+      - name: Upload debug artifacts
+        if: always() && steps.check.outputs.status == 'failed'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Commit state / keepalive
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          COMMITTED=0
+          if ! git diff --cached --quiet; then
+            git commit -m "state: $(date -u +%Y-%m-%dT%H:%MZ)"
+            COMMITTED=1
+          elif [ $(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 )) -ge 25 ]; then
+            git commit --allow-empty -m "keepalive: reset 60-day schedule-disable timer"
+            COMMITTED=1
+          fi
+          if [ "$COMMITTED" = "1" ]; then
+            for i in 1 2 3; do git push && break || git pull --rebase; done
+          fi
