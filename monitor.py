@@ -45,6 +45,34 @@ def dump_debug(page) -> None:
         print(f"WARN: debug capture failed: {e}", file=sys.stderr)
 
 
+def dismiss_consent(page) -> None:
+    """Close the Borlabs cookie-consent modal a fresh profile gets served.
+
+    It overlays the whole page and swallows clicks meant for the reCAPTCHA.
+    Prefer essential-only; the captcha widget renders before consent anyway.
+    """
+    dialog = page.locator("#BorlabsCookieBox")
+    try:
+        dialog.wait_for(state="visible", timeout=5000)
+    except Exception:
+        return
+    for pattern in (r"nur essenzielle|only essential|essential only",
+                    r"akzeptiere alle|accept all",
+                    r"einwilligung speichern|save consent"):
+        try:
+            dialog.locator("button, a[role='button']").filter(
+                has_text=re.compile(pattern, re.I)
+            ).first.click(timeout=4000)
+            page.wait_for_timeout(2000)
+            print(f"INFO: consent dismissed via /{pattern}/", file=sys.stderr)
+            return
+        except Exception:
+            continue
+    dump_debug(page)
+    print("WARN: consent box visible but no known button matched",
+          file=sys.stderr)
+
+
 def captcha_token_present(page) -> bool:
     try:
         return page.evaluate("""
@@ -80,6 +108,8 @@ def main() -> None:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(4000)
+
+        dismiss_consent(page)
 
         solved = captcha_token_present(page)
         if not solved:
